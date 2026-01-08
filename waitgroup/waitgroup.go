@@ -11,11 +11,8 @@ import "fmt"
 // Wait can be used to block until all goroutines have finished.
 type WaitGroup struct {
 	cnt int
-	// канал размера 1 - если в канале что-то есть, то ждать не надо
-	// если ничего нет, то ждём (wait) когда появиться
-	ch chan struct{}
-	// mutex для эксклюзивной работы с cnt
-	mu chan struct{}
+	ch  chan struct{}
+	mu  chan struct{}
 }
 
 // New creates WaitGroup.
@@ -53,14 +50,12 @@ func (wg *WaitGroup) Add(delta int) {
 		fmt.Print("Try to panic\n")
 		panic("negative WaitGroup counter")
 	}
-	// Если счетчик стал больше нуля (был 0 или меньше), нужно убрать токен из канала
 	if oldCnt == 0 && wg.cnt > 0 {
 		select {
 		case <-wg.ch:
 		default:
 		}
 	}
-	// Если счетчик стал нулем, нужно положить токен в канал
 	if wg.cnt == 0 {
 		select {
 		case wg.ch <- struct{}{}:
@@ -70,12 +65,10 @@ func (wg *WaitGroup) Add(delta int) {
 	wg.mu <- struct{}{}
 }
 
-// Done decrements the WaitGroup counter by one.
 func (wg *WaitGroup) Done() {
 	wg.Add(-1)
 }
 
-// Wait blocks until the WaitGroup counter is zero.
 func (wg *WaitGroup) Wait() {
 	<-wg.mu
 	if wg.cnt == 0 {
@@ -84,8 +77,6 @@ func (wg *WaitGroup) Wait() {
 	}
 	wg.mu <- struct{}{}
 	<-wg.ch
-	// После пробуждения нужно вернуть токен обратно в канал
-	// Но только если счетчик действительно равен нулю
 	<-wg.mu
 	if wg.cnt == 0 {
 		select {
