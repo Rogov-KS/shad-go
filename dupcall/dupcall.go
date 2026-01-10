@@ -34,10 +34,15 @@ func (o *Call) LazyInit(
 	o.mu.Unlock()
 
 	copyCtx, cancel := context.WithCancel(context.Background())
+	o.mu.Lock()
 	o.cancel = cancel
+	o.mu.Unlock()
+
 	go func() {
 		res, err := cb(copyCtx)
+		o.mu.Lock()
 		o.res = callResult{res: res, err: err}
+		o.mu.Unlock()
 		atomic.StoreInt32(&o.isRunning, 0)
 		// Закрываем канал, чтобы все ожидающие горутины получили сигнал
 		close(o.ch)
@@ -49,8 +54,6 @@ func (o *Call) Do(
 	ctx context.Context,
 	cb func(context.Context) (interface{}, error),
 ) (result interface{}, err error) {
-	atomic.AddInt64(&o.cntRunning, 1)
-
 	// Ленивая инициализация cond с мьютексом
 	o.mu.Lock()
 	if o.cond.L == nil {
@@ -60,14 +63,25 @@ func (o *Call) Do(
 
 	var ch chan struct{}
 	if atomic.CompareAndSwapInt32(&o.isRunning, 0, 1) {
+		atomic.AddInt64(&o.cntRunning, 1)
 		ch = o.LazyInit(ctx, cb)
 	} else {
 		o.mu.Lock()
 		for o.ch == nil {
 			o.cond.Wait()
+			// Проверяем контекст после каждого пробуждения
+			if ctx.Err() != nil {
+				o.mu.Unlock()
+				return nil, ctx.Err()
+			}
 		}
 		ch = o.ch
 		o.mu.Unlock()
+		// Проверяем контекст перед увеличением счетчика
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		atomic.AddInt64(&o.cntRunning, 1)
 	}
 
 	// Важно: сначала проверяем результат, потом отмену
@@ -76,24 +90,38 @@ func (o *Call) Do(
 	case <-ch:
 		// Канал закрыт, результат готов в o.res
 		cnt := atomic.AddInt64(&o.cntRunning, -1)
+		o.mu.Lock()
+		res := o.res
+		o.mu.Unlock()
 		if cnt == 0 {
+			o.mu.Lock()
 			if o.cancel != nil {
 				o.cancel()
+				o.cancel = nil
 			}
+			o.mu.Unlock()
+			atomic.StoreInt32(&o.isRunning, 0)
 		}
-		return o.res.res, o.res.err
+		return res.res, res.err
 	case <-ctx.Done():
 		cnt := atomic.AddInt64(&o.cntRunning, -1)
 		if cnt == 0 {
+			o.mu.Lock()
 			if o.cancel != nil {
 				o.cancel()
+				o.cancel = nil
 			}
+			o.mu.Unlock()
+			atomic.StoreInt32(&o.isRunning, 0)
 		}
 		// Проверяем, может результат уже готов
 		select {
 		case <-ch:
 			// Канал закрыт, результат готов в o.res
-			return o.res.res, o.res.err
+			o.mu.Lock()
+			res := o.res
+			o.mu.Unlock()
+			return res.res, res.err
 		default:
 			return nil, ctx.Err()
 		}
