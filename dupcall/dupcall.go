@@ -4,7 +4,7 @@ package dupcall
 
 import (
 	"context"
-	"runtime"
+	"sync"
 	"sync/atomic"
 )
 
@@ -19,6 +19,30 @@ type Call struct {
 	cancel     context.CancelFunc
 	ch         chan struct{}
 	res        callResult
+	mu         sync.Mutex
+	cond       sync.Cond
+}
+
+func (o *Call) LazyInit(
+	ctx context.Context,
+	cb func(context.Context) (interface{}, error),
+) chan struct{} {
+	// Создаём новый канал для каждого нового вызова
+	o.mu.Lock()
+	o.ch = make(chan struct{})
+	o.cond.Broadcast()
+	o.mu.Unlock()
+
+	copyCtx, cancel := context.WithCancel(context.Background())
+	o.cancel = cancel
+	go func() {
+		res, err := cb(copyCtx)
+		o.res = callResult{res: res, err: err}
+		atomic.StoreInt32(&o.isRunning, 0)
+		// Закрываем канал, чтобы все ожидающие горутины получили сигнал
+		close(o.ch)
+	}()
+	return o.ch
 }
 
 func (o *Call) Do(
@@ -26,43 +50,24 @@ func (o *Call) Do(
 	cb func(context.Context) (interface{}, error),
 ) (result interface{}, err error) {
 	atomic.AddInt64(&o.cntRunning, 1)
-	if atomic.CompareAndSwapInt32(&o.isRunning, 0, 1) {
-		// Создаём новый канал для каждого нового вызова
-		o.ch = make(chan struct{})
-		copyCtx, cancel := context.WithCancel(context.Background())
-		o.cancel = cancel
-		go func() {
-			res, err := cb(copyCtx)
-			o.res = callResult{res: res, err: err}
-			atomic.StoreInt32(&o.isRunning, 0)
-			// Закрываем канал, чтобы все ожидающие горутины получили сигнал
-			close(o.ch)
-		}()
 
+	// Ленивая инициализация cond с мьютексом
+	o.mu.Lock()
+	if o.cond.L == nil {
+		o.cond = *sync.NewCond(&o.mu)
 	}
+	o.mu.Unlock()
 
-	// Сохраняем ссылку на канал локально, чтобы избежать гонки
-	// между созданием нового канала и входом в select
-	ch := o.ch
-	if ch == nil {
-		// Если канал ещё не создан, это означает, что мы находимся
-		// в очень редкой гонке между проверкой CAS и созданием канала.
-		// В этом случае ждём, пока канал не будет создан
-		for ch == nil {
-			select {
-			case <-ctx.Done():
-				cnt := atomic.AddInt64(&o.cntRunning, -1)
-				if cnt == 0 {
-					if o.cancel != nil {
-						o.cancel()
-					}
-				}
-				return nil, ctx.Err()
-			default:
-				runtime.Gosched() // Передаём управление другим горутинам
-				ch = o.ch
-			}
+	var ch chan struct{}
+	if atomic.CompareAndSwapInt32(&o.isRunning, 0, 1) {
+		ch = o.LazyInit(ctx, cb)
+	} else {
+		o.mu.Lock()
+		for o.ch == nil {
+			o.cond.Wait()
 		}
+		ch = o.ch
+		o.mu.Unlock()
 	}
 
 	// Важно: сначала проверяем результат, потом отмену
