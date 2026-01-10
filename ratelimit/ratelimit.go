@@ -45,39 +45,12 @@ func (l *Limiter) run() {
 
 	// Если interval == 0, разрешаем все запросы сразу
 	if l.interval == 0 {
-		for {
-			select {
-			case req := <-l.requestCh:
-				select {
-				case <-req.ctx.Done():
-					req.response <- req.ctx.Err()
-				default:
-					req.response <- nil
-				}
-			case <-l.stopCh:
-				// Обрабатываем все оставшиеся запросы
-				for {
-					select {
-					case req := <-l.requestCh:
-						select {
-						case <-req.ctx.Done():
-							req.response <- req.ctx.Err()
-						default:
-							req.response <- ErrStopped
-						}
-					default:
-						return
-					}
-				}
-			}
-		}
+		l.runUnlimited()
+		return
 	}
 
 	// Периодически очищаем старые временные метки
-	cleanupInterval := l.interval / 10
-	if cleanupInterval < time.Millisecond*100 {
-		cleanupInterval = time.Millisecond * 100
-	}
+	cleanupInterval := max(l.interval/10, time.Millisecond*100)
 	cleanupTicker := time.NewTicker(cleanupInterval)
 	defer cleanupTicker.Stop()
 
@@ -85,81 +58,140 @@ func (l *Limiter) run() {
 		currentTime := now()
 
 		// Удаляем временные метки старше interval
-		cutoff := currentTime.Add(-l.interval)
-		for len(timestamps) > 0 && timestamps[0].Before(cutoff) {
-			timestamps = timestamps[1:]
-		}
+		timestamps = l.cleanupOldTimestamps(timestamps, currentTime)
 
 		// Пробуждаем ожидающих, если есть место
-		for len(waiting) > 0 && len(timestamps) < l.maxCount {
-			req := waiting[0]
-			waiting = waiting[1:]
+		timestamps, waiting = l.processWaitingRequests(timestamps, waiting, currentTime)
 
-			select {
-			case <-req.ctx.Done():
-				req.response <- req.ctx.Err()
-				continue
-			default:
-			}
-
-			timestamps = append(timestamps, currentTime)
-			req.response <- nil
+		// Обрабатываем события (новые запросы, тикер очистки или остановку)
+		var shouldStop bool
+		timestamps, waiting, shouldStop = l.processEvents(timestamps, waiting, currentTime, cleanupTicker)
+		if shouldStop {
+			return
 		}
+	}
+}
 
+// runUnlimited обрабатывает запросы без ограничений (когда interval == 0)
+func (l *Limiter) runUnlimited() {
+	for {
 		select {
 		case req := <-l.requestCh:
-			// Проверяем контекст сразу
-			select {
-			case <-req.ctx.Done():
-				req.response <- req.ctx.Err()
-				continue
-			default:
-			}
-
-			// Удаляем старые временные метки перед проверкой
-			cutoff = currentTime.Add(-l.interval)
-			for len(timestamps) > 0 && timestamps[0].Before(cutoff) {
-				timestamps = timestamps[1:]
-			}
-
-			if len(timestamps) < l.maxCount {
-				timestamps = append(timestamps, currentTime)
-				req.response <- nil
-			} else {
-				waiting = append(waiting, req)
-			}
-
-		case <-cleanupTicker.C:
-			// Периодическая очистка - уже сделано выше в цикле
-			continue
+			l.sendResponse(req, nil)
 
 		case <-l.stopCh:
-			// Отправляем ошибку всем ожидающим
-			for _, req := range waiting {
-				select {
-				case <-req.ctx.Done():
-					req.response <- req.ctx.Err()
-				default:
-					req.response <- ErrStopped
-				}
-			}
-			// Обрабатываем все оставшиеся запросы в канале
-			// Используем таймаут, чтобы не зависнуть навсегда
+			// Обрабатываем все оставшиеся запросы
 			for {
 				select {
 				case req := <-l.requestCh:
-					select {
-					case <-req.ctx.Done():
-						req.response <- req.ctx.Err()
-					default:
-						req.response <- ErrStopped
-					}
-				case <-time.After(time.Millisecond * 100):
-					// Если нет новых запросов за 100ms, выходим
+					l.sendResponse(req, ErrStopped)
+				default:
 					return
 				}
 			}
 		}
+	}
+}
+
+// cleanupOldTimestamps удаляет временные метки старше interval
+func (l *Limiter) cleanupOldTimestamps(timestamps []time.Time, currentTime time.Time) []time.Time {
+	cutoff := currentTime.Add(-l.interval)
+	for len(timestamps) > 0 && timestamps[0].Before(cutoff) {
+		timestamps = timestamps[1:]
+	}
+	return timestamps
+}
+
+// processWaitingRequests пробуждает ожидающие запросы, если есть место
+func (l *Limiter) processWaitingRequests(timestamps []time.Time, waiting []acquireRequest, currentTime time.Time) ([]time.Time, []acquireRequest) {
+	for len(waiting) > 0 && len(timestamps) < l.maxCount {
+		req := waiting[0]
+		waiting = waiting[1:]
+
+		if l.isContextDone(req.ctx) {
+			req.response <- req.ctx.Err()
+			continue
+		}
+
+		timestamps = append(timestamps, currentTime)
+		req.response <- nil
+	}
+	return timestamps, waiting
+}
+
+// processEvents обрабатывает события: новые запросы, тикер очистки или остановку
+func (l *Limiter) processEvents(timestamps []time.Time, waiting []acquireRequest, currentTime time.Time, cleanupTicker *time.Ticker) ([]time.Time, []acquireRequest, bool) {
+	select {
+	case req := <-l.requestCh:
+		timestamps, waiting = l.handleNewRequest(req, timestamps, waiting, currentTime)
+		return timestamps, waiting, false
+
+	case <-cleanupTicker.C:
+		// Периодическая очистка - уже сделано выше в цикле, просто продолжаем цикл
+		return timestamps, waiting, false
+
+	case <-l.stopCh:
+		l.handleStop(waiting)
+		return timestamps, waiting, true
+	}
+}
+
+// handleNewRequest обрабатывает новый запрос
+func (l *Limiter) handleNewRequest(req acquireRequest, timestamps []time.Time, waiting []acquireRequest, currentTime time.Time) ([]time.Time, []acquireRequest) {
+	if l.isContextDone(req.ctx) {
+		req.response <- req.ctx.Err()
+		return timestamps, waiting
+	}
+
+	// Удаляем старые временные метки перед проверкой
+	timestamps = l.cleanupOldTimestamps(timestamps, currentTime)
+
+	if len(timestamps) < l.maxCount {
+		timestamps = append(timestamps, currentTime)
+		req.response <- nil
+	} else {
+		waiting = append(waiting, req)
+	}
+	return timestamps, waiting
+}
+
+// handleStop обрабатывает остановку лимитера
+func (l *Limiter) handleStop(waiting []acquireRequest) {
+	// Отправляем ошибку всем ожидающим
+	for _, req := range waiting {
+		l.sendResponse(req, ErrStopped)
+	}
+
+	// Обрабатываем все оставшиеся запросы в канале
+	// Используем таймаут, чтобы не зависнуть навсегда
+	for {
+		select {
+		case req := <-l.requestCh:
+			l.sendResponse(req, ErrStopped)
+		case <-time.After(time.Millisecond * 100):
+			// Если нет новых запросов за 100ms, выходим
+			return
+		}
+	}
+}
+
+// sendResponse отправляет ответ на запрос с учетом контекста
+func (l *Limiter) sendResponse(req acquireRequest, err error) {
+	select {
+	case <-req.ctx.Done():
+		req.response <- req.ctx.Err()
+	default:
+		req.response <- err
+	}
+}
+
+// isContextDone проверяет, отменен ли контекст
+func (l *Limiter) isContextDone(ctx context.Context) bool {
+	select {
+	case <-ctx.Done():
+		return true
+	default:
+		return false
 	}
 }
 
