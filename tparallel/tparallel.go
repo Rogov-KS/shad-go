@@ -9,10 +9,9 @@ import (
 type T struct {
 	isEnd         chan struct{}
 	isParallel    chan struct{}
-	wg            sync.WaitGroup
-	waitParallel  *sync.Cond
-	cWaitParallel *sync.Cond
-	i             int
+	wg            sync.WaitGroup // Для ожидания всех (особенно паралельных) тестов
+	waitParallel  *sync.Cond     // Для реализации t.Parallel
+	cWaitParallel *sync.Cond     // Для пробуждения запущенных паралельных под-тестов после последовательных тестов
 }
 
 func New() *T {
@@ -40,7 +39,6 @@ func (t *T) Run(subtest func(t *T)) {
 
 	subT := New()
 	subT.waitParallel = t.cWaitParallel
-	subT.i = t.i
 
 	go func() {
 		subtest(subT)
@@ -64,9 +62,8 @@ func Run(topTests []func(t *T)) {
 	tLst := make([]*T, 0)
 
 	// Запускаем все top-level тесты последовательно
-	for i, test := range topTests {
+	for _, test := range topTests {
 		t := New()
-		t.i = i
 		t.waitParallel = cond
 
 		tLst = append(tLst, t)
@@ -86,10 +83,7 @@ func Run(topTests []func(t *T)) {
 		}
 	}
 
-	// Разблокируем все top-level параллельные тесты
 	cond.Broadcast()
-
-	// Ждем завершения всех тестов
 	for _, t := range tLst {
 		t.wg.Wait()
 	}
