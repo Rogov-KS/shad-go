@@ -2,17 +2,95 @@
 
 package tparallel
 
+import (
+	"sync"
+)
+
 type T struct {
+	isEnd         chan struct{}
+	isParallel    chan struct{}
+	wg            sync.WaitGroup
+	waitParallel  *sync.Cond
+	cWaitParallel *sync.Cond
+	i             int
+}
+
+func New() *T {
+	t := &T{
+		isEnd:      make(chan struct{}),
+		isParallel: make(chan struct{}),
+	}
+	var mu, cmu sync.Mutex
+	t.waitParallel = sync.NewCond(&mu)
+	t.cWaitParallel = sync.NewCond(&cmu)
+	return t
 }
 
 func (t *T) Parallel() {
-	panic("implement me")
+	close(t.isParallel)
+	if t.waitParallel != nil {
+		t.waitParallel.L.Lock()
+		defer t.waitParallel.L.Unlock()
+		t.waitParallel.Wait()
+	}
 }
 
 func (t *T) Run(subtest func(t *T)) {
-	panic("implement me")
+	t.wg.Add(1)
+
+	subT := New()
+	subT.waitParallel = t.cWaitParallel
+	subT.i = t.i
+
+	go func() {
+		subtest(subT)
+		subT.cWaitParallel.Broadcast()
+		subT.wg.Wait()
+		t.wg.Done()
+		close(subT.isEnd)
+	}()
+
+	select {
+	case <-subT.isEnd:
+		// Функция под-теста завершилась
+	case <-subT.isParallel:
+		// Под-тест стал параллельным, продолжаем
+	}
 }
 
 func Run(topTests []func(t *T)) {
-	panic("implement me")
+	var mu sync.Mutex
+	cond := sync.NewCond(&mu)
+	tLst := make([]*T, 0)
+
+	// Запускаем все top-level тесты последовательно
+	for i, test := range topTests {
+		t := New()
+		t.i = i
+		t.waitParallel = cond
+
+		tLst = append(tLst, t)
+
+		t.wg.Add(1)
+		go func() {
+			test(t)
+			t.wg.Done()
+			close(t.isEnd)
+		}()
+
+		select {
+		case <-t.isEnd:
+			// Тест завершился последовательно
+		case <-t.isParallel:
+			// Тест стал параллельным, продолжаем к следующему
+		}
+	}
+
+	// Разблокируем все top-level параллельные тесты
+	cond.Broadcast()
+
+	// Ждем завершения всех тестов
+	for _, t := range tLst {
+		t.wg.Wait()
+	}
 }
