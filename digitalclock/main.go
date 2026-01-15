@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"image"
+	"image/color"
 	"image/png"
 	"log"
 	"log/slog"
@@ -171,9 +172,7 @@ func GetImage(c *gin.Context, scale int64, symbols []rune) *image.RGBA {
 	realW := (6*symW + 2*colonW) * int(scale)
 	logger.Info("Cacl sym H and W", "width", symW, "height", symH, "colonW", colonW, "colonH", colonH)
 
-	// img := image.NewRGBA(image.Rect(0, 0, 5, 5))
 	img := image.NewRGBA(image.Rect(0, 0, realW, realH))
-	// img.Set(2, 0, color.RGBA{255, 0, 0, 255})
 
 	prevWidth := 0
 	for _, sym := range symbols {
@@ -187,17 +186,20 @@ func GetImage(c *gin.Context, scale int64, symbols []rune) *image.RGBA {
 			curW = symW
 		}
 		curH := symH
-		for i := range curW {
-			for j := range curH {
+		for i := 0; i < curW; i++ {
+			for j := 0; j < curH; j++ {
 				curSymVal := imgSymSplitted[j][i]
+				var clr color.Color
 				if curSymVal == '.' {
-					continue
+					clr = White
+				} else {
+					clr = Cyan
 				}
-				for k_w := range scale {
-					for k_h := range scale {
+				for k_w := int64(0); k_w < scale; k_w++ {
+					for k_h := int64(0); k_h < scale; k_h++ {
 						img.Set(prevWidth+i*int(scale)+int(k_w),
 							j*int(scale)+int(k_h),
-							Cyan)
+							clr)
 					}
 				}
 			}
