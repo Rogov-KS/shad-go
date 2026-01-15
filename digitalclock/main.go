@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"flag"
 	"fmt"
 	"image"
 	"image/color"
@@ -345,17 +346,18 @@ func getDigClock(c *gin.Context) {
 // }
 
 func GetPort() (port uint16, err error) {
-	args := os.Args
-	if len(args) != 3 || args[1] != "-port" {
-		return 0, fmt.Errorf("usage: %s -port <port_number>", args[0])
+	portFlag := flag.Uint64("port", 0, "port number to listen on")
+	flag.Parse()
+
+	if *portFlag == 0 {
+		return 0, fmt.Errorf("usage: %s -port <port_number>", os.Args[0])
 	}
-	// В Go нельзя напрямую кастовать строку в число
-	// Нужно использовать strconv.ParseInt или strconv.Atoi
-	portInt, err := strconv.ParseUint(args[2], 10, 16)
-	if err != nil {
-		return 0, fmt.Errorf("invalid port number: %w", err)
+
+	if *portFlag > 65535 {
+		return 0, fmt.Errorf("invalid port number: port must be between 1 and 65535")
 	}
-	port = uint16(portInt) // Каст uint64 -> uint16 (числовые типы можно кастовать)
+
+	port = uint16(*portFlag)
 	slog.Info("parsed port", "port", port)
 	return port, nil
 }
