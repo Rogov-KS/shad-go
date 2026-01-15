@@ -5,6 +5,7 @@ package main
 import "image/color"
 
 var Cyan = color.RGBA{R: 100, G: 200, B: 200, A: 0xff}
+var White = color.RGBA{R: 255, G: 255, B: 255, A: 0xff}
 
 const (
 	Zero = `........
@@ -150,3 +151,17 @@ const (
 ....
 ....`
 )
+
+var int2Syms = map[rune]string{
+	'0': Zero,
+	'1': One,
+	'2': Two,
+	'3': Three,
+	'4': Four,
+	'5': Five,
+	'6': Six,
+	'7': Seven,
+	'8': Eight,
+	'9': Nine,
+	':': Colon,
+}
